@@ -23,6 +23,12 @@ sessionHasFocus := False
 sessionOrigX := 0
 sessionOrigY := 0
 
+batchActive := False
+batchEvents := []
+batchStartTick := 0
+batchTimeoutMs := 800
+nextGroupId := 1
+
 SetTimer, ProcessMirrorQueue, 30
 
 ; =============================
@@ -177,6 +183,7 @@ ToggleMirroring:
         UpdateQueueIndicator()
         GuiControl,, ToggleButton, Start mirroring
         AppendLog("Mirroring paused and queue cleared.")
+        ResetBatchState()
     }
 return
 
@@ -232,7 +239,9 @@ return
 ; =============================
 
 ProcessMirrorQueue:
-    global mirrorQueue, mirrorEnabled
+    global mirrorQueue, mirrorEnabled, isMirroring
+    if (isMirroring)
+        return
     if (!mirrorEnabled)
     {
         if (QueueCount() > 0)
@@ -246,18 +255,21 @@ ProcessMirrorQueue:
         return
 
     now := A_TickCount
+    nextEvent := mirrorQueue[1]
+    if (nextEvent.time > now)
+        return
+
+    groupId := nextEvent.group
     events := []
-    while (QueueCount() > 0)
+    while (QueueCount() > 0 && mirrorQueue[1].group = groupId)
     {
-        nextEvent := mirrorQueue[1]
-        if (nextEvent.time > now)
-            break
-        events.Push(nextEvent)
+        events.Push(mirrorQueue[1])
         mirrorQueue.RemoveAt(1)
     }
+
     if (events.MaxIndex())
     {
-        ExecuteMirrorBatch(events)
+        ExecuteMirrorGroup(events)
         UpdateQueueIndicator()
     }
 return
@@ -273,33 +285,77 @@ QueueClickEvent()
     DllCall("ScreenToClient", "ptr", mainHwnd, "ptr", &pt)
     relX := NumGet(pt, 0, "int")
     relY := NumGet(pt, 4, "int")
-    ScheduleMirrorEvent("click", relX, relY)
-    AppendLog("Queued click at " relX "," relY)
+    CaptureEvent("click", relX, relY)
+    AppendLog("Captured click " relX "," relY)
 }
 
 QueueKeyEvent(keyName)
 {
-    ScheduleMirrorEvent("key", keyName)
-    AppendLog("Queued key " keyName)
+    CaptureEvent("key", keyName)
+    AppendLog("Captured key " keyName)
 }
 
-ScheduleMirrorEvent(eventType, param1 := "", param2 := "")
+CaptureEvent(eventType, param1 := "", param2 := "")
 {
-    global mirrorQueue, mirrorIntervalMs
-    event := {}
-    event.time := A_TickCount + mirrorIntervalMs
-    event.type := eventType
-    event.param1 := param1
-    event.param2 := param2
-    mirrorQueue.Push(event)
+    global batchActive, batchEvents, batchStartTick
+    now := A_TickCount
+    if (!batchActive)
+    {
+        batchActive := True
+        batchStartTick := now
+        batchEvents := []
+    }
+    event := {"type": eventType, "param1": param1, "param2": param2, "offset": now - batchStartTick}
+    batchEvents.Push(event)
+    ResetBatchTimer()
+}
+
+ResetBatchTimer()
+{
+    global batchTimeoutMs
+    SetTimer, FinalizeBatch, Off
+    delay := batchTimeoutMs * -1
+    SetTimer, FinalizeBatch, %delay%
+}
+
+FinalizeBatch:
+    ProcessBatch()
+return
+
+ProcessBatch()
+{
+    global batchActive, batchEvents, nextGroupId, mirrorQueue, mirrorIntervalMs
+    if (!batchActive)
+        return
+    if !(batchEvents.MaxIndex())
+        return
+    groupId := nextGroupId
+    nextGroupId++
+    dueTime := A_TickCount + mirrorIntervalMs
+    for index, ev in batchEvents
+    {
+        event := {"group": groupId, "time": dueTime, "offset": ev.offset, "type": ev.type, "param1": ev.param1, "param2": ev.param2}
+        mirrorQueue.Push(event)
+    }
     UpdateQueueIndicator()
+    AppendLog(Format("Queued batch (%d event(s)).", batchEvents.MaxIndex()))
+    batchEvents := []
+    batchActive := False
+}
+
+ResetBatchState()
+{
+    global batchActive, batchEvents
+    SetTimer, FinalizeBatch, Off
+    batchActive := False
+    batchEvents := []
 }
 
 ; =============================
 ; Mirror execution
 ; =============================
 
-ExecuteMirrorBatch(events)
+ExecuteMirrorGroup(events)
 {
     global isMirroring
     if (!BeginMirrorSession())
@@ -309,22 +365,22 @@ ExecuteMirrorBatch(events)
     }
 
     isMirroring := True
+    prevOffset := 0
     for index, ev in events
     {
+        delay := ev.offset - prevOffset
+        if (delay > 0)
+            Sleep, delay
         if (ev.type = "click")
-        {
             MirrorClickAction(ev.param1, ev.param2)
-        }
         else if (ev.type = "key")
-        {
             MirrorKeyAction(ev.param1)
-        }
-        Sleep, 25
+        prevOffset := ev.offset
     }
     EndMirrorSession()
     isMirroring := False
 
-    AppendLog(Format("Replayed {1} event(s).", events.MaxIndex()))
+    AppendLog(Format("Replayed %d event(s).", events.MaxIndex()))
 }
 
 BeginMirrorSession()
@@ -337,10 +393,9 @@ BeginMirrorSession()
     WinActivate, ahk_id %targetHwnd%
     WinWaitActive, ahk_id %targetHwnd%,, 0.3
     if (ErrorLevel)
-    {
         return False
-    }
     sessionHasFocus := True
+    Sleep, 50
     return True
 }
 
